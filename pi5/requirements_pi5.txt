@@ -1,0 +1,6 @@
+# Raspberry Pi 5 运行环境依赖
+# 安装命令: pip install -r requirements_pi5.txt
+tflite-runtime>=2.14.0
+numpy>=1.26.0
+sounddevice>=0.4.6
+scipy>=1.12.0

@@ -1,0 +1,16 @@
+{
+  "categories": [
+    "meow",
+    "purr",
+    "yowl",
+    "other"
+  ],
+  "num_classes": 4,
+  "img_size": 128,
+  "target_sr": 22050,
+  "n_mels": 128,
+  "n_fft": 1024,
+  "hop_length": 256,
+  "clip_duration": 1.0,
+  "test_accuracy": 0.7497639060020447
+}

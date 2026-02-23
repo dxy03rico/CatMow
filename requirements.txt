@@ -1,0 +1,13 @@
+# Mac 训练环境依赖
+# Apple Silicon (M1/M2/M3) 用户额外运行: pip install tensorflow-metal
+tensorflow>=2.16.0
+librosa>=0.10.1
+numpy>=1.26.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
+matplotlib>=3.8.0
+soundfile>=0.12.1
+tqdm>=4.66.0
+requests>=2.31.0
+Pillow>=10.2.0
+audioread>=3.0.0
