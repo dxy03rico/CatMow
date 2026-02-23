@@ -162,7 +162,188 @@ CLASS_THRESHOLDS = {
 
 ---
 
-## 五、v1 vs v2 训练结果对比
+## 五、工程与部署问题
+
+---
+
+### 工程问题 1：训练耗时长，需要后台运行与进度监控
+
+**背景：** 训练一次约需 30-60 分钟，不能阻塞终端。
+
+**解决方案：** 使用后台进程 + 日志文件监控：
+
+```bash
+# 后台运行训练，输出重定向到日志
+/opt/homebrew/bin/python3.11 scripts/03_train.py > /tmp/train_v2.log 2>&1 &
+
+# 实时查看训练进度（不打断训练）
+tail -f /tmp/train_v2.log
+
+# 确认进程还在运行
+ps aux | grep train
+```
+
+**教训：** 长时间任务必须后台化 + 持久化日志，随时可以脱离终端观察进度，也方便事后追溯最佳 epoch。
+
+---
+
+### 工程问题 2：录音脚本 `record_yowl.py` 三个 Bug 导致无法录音
+
+**背景：** 为了采集 yowl 数据，在 Pi5 上编写了录音脚本，但运行后程序卡死、Ctrl+C 无法退出、文件从未保存。
+
+**三个 Bug：**
+
+① **主线程卡死**：使用了 `sd.InputStream` + callback + `threading.Event` 的方式。sounddevice 的 PortAudio 回调线程与 Python 主线程之间存在 GIL 冲突，`done_event.set()` 触发后主线程的 while 循环无法退出。
+
+② **q 键退出无效**：程序卡在 while 循环时，永远无法到达 `input("q退出")` 这一行。
+
+③ **Ctrl+C 强制退出时文件未保存**：`wavfile.write()` 在 while 循环之后，被强制退出直接跳过了。
+
+**修复方案：用 `sd.rec()` 替代 callback 方式**
+
+```python
+# 修复后的核心逻辑
+recording = sd.rec(total_frames, samplerate=SAMPLE_RATE, channels=1)
+try:
+    while not done:
+        elapsed = time.time() - start_time
+        rms = np.sqrt(np.mean(recording[:frames_recorded] ** 2))
+        print(f"\r[{elapsed:.1f}s] RMS: {rms:.4f}", end="")
+        time.sleep(0.5)
+    sd.wait()
+except KeyboardInterrupt:
+    sd.stop()                    # Ctrl+C 时先停录音
+    wavfile.write(path, ...)     # 再保存已录内容
+    print("提前结束，文件已保存")
+```
+
+**效果：** 成功在 Pi5 上录制了 13 段 yowl 音频（每段 90s），筛选保留 11 段。
+
+---
+
+### 工程问题 3：数据在 Pi5 和 Mac 之间的传输
+
+**场景：** 在 Pi5 上录音 → 传回 Mac 训练 → 训练好的模型传到 Pi5 推理。
+
+**使用 scp 双向传输：**
+
+```bash
+# Pi5 → Mac：拉取录音数据
+scp -r xiaoyan@10.0.0.16:~/catmow/yowl_recordings/ data/raw/yowl/
+
+# Mac → Pi5：部署新模型和推理脚本
+scp models/cat_sound.tflite pi5/pi5_inference.py xiaoyan@10.0.0.16:~/catmow/
+```
+
+**问题：** 每次修改推理脚本后都要手动 scp，容易忘记，导致 Pi5 上跑的是旧版本。
+
+**教训：** 多设备开发场景下，部署步骤应该固化成脚本（`deploy.sh`），避免手动操作遗漏。
+
+---
+
+### 工程问题 4：TFLite 转换与验证
+
+**背景：** Keras 模型需要转换为 TFLite 才能在 Pi5 上高效推理。
+
+**转换流程：**
+```python
+converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
+converter.optimizations = [tf.lite.Optimize.DEFAULT]   # 量化优化
+tflite_model = converter.convert()
+# 输出：cat_sound.tflite，9.83 MB
+```
+
+**验证步骤：** 转换后用前100条测试样本对比 Keras 和 TFLite 输出，确认量化误差在可接受范围内：
+
+```
+TFLite 验证（前100条）：meow=100%, purr=70%, yowl=25%, other=5%
+```
+
+**教训：** 量化会损失精度，转换后必须验证，不能直接假设结果与 Keras 一致。
+
+---
+
+### 工程问题 5：大文件管理与 Git 仓库设计
+
+**问题：** 项目目录总大小约 6GB，但其中绝大部分是中间产物：
+
+| 目录 | 大小 | 说明 |
+|------|------|------|
+| `data/features/` | 5.7 GB | numpy 预处理缓存（X.npy, y.npy） |
+| `models/` | 108 MB | Keras 模型文件 |
+| `data/processed/` | 227 MB | 原始音频切片 |
+| `models/cat_sound.tflite` | 9.8 MB | 最终推理模型 |
+| `scripts/` + `pi5/` | 56 KB | 核心代码 |
+
+**策略：** `.gitignore` 只排除不必要的大文件，保留真正有价值的内容：
+
+```gitignore
+data/features/          # 可随时重新生成，不上传
+data/raw/               # 音频原文件较大，不上传
+models/*.keras          # Keras 格式较大，只上传 .tflite
+models/saved_model_export/
+```
+
+**最终上传内容：** scripts/ + pi5/ + data/processed/ + cat_sound.tflite = **~189 MB**，符合 GitHub 限制。
+
+---
+
+### 工程问题 6：GitHub 上传三连坑
+
+这是工程经历中最曲折的部分，踩了三个独立的坑。
+
+**坑1：GitHub 已停止密码认证（403 Permission Denied）**
+
+2021 年 8 月起，GitHub 不再接受账号密码进行 git 操作。输入密码会报：
+```
+remote: Permission to dxy03rico/CatMow.git denied to dxy03rico.
+fatal: unable to access: The requested URL returned error: 403
+```
+
+**解决：** 必须使用 Personal Access Token（PAT）。在 github.com/settings/tokens 生成，勾选 `repo` 权限，将 token 作为"密码"输入。
+
+---
+
+**坑2：macOS 系统 git 的 LibreSSL SSL 错误**
+
+使用 PAT 后仍然失败：
+```
+error: RPC failed; curl 55 LibreSSL SSL_read:
+  error:1404C3FC:SSL routines:ST_OK:sslv3 alert bad record mac
+fatal: the remote end hung up unexpectedly
+```
+
+**根因：** macOS 自带的 git（`/usr/bin/git`）使用 LibreSSL，在传输大文件（~189MB）时有已知的 SSL 握手 bug。
+
+**解决：** 安装 Homebrew 版 git（使用 OpenSSL），切换后立即成功：
+```bash
+brew install git
+/opt/homebrew/bin/git push -u origin main   # ✅ 成功
+```
+
+长期解决方案：将 Homebrew git 加入 PATH 优先级：
+```bash
+echo 'export PATH="/opt/homebrew/bin:$PATH"' >> ~/.zshrc
+```
+
+---
+
+**坑3：`Everything up-to-date` 误导性提示**
+
+在 LibreSSL 错误发生后，git 输出了令人困惑的 `Everything up-to-date`，让人以为 push 成功了。
+
+**验证方法：** 不能只看 git 提示，要用 `git ls-remote origin` 确认远端实际状态：
+```bash
+git ls-remote origin
+# 空输出 → 远端确实为空，push 失败
+# 有 commit hash → push 成功
+```
+
+**教训：** 工程操作要验证结果，不要只信工具的输出信息。
+
+---
+
+## 六、v1 vs v2 训练结果对比
 
 | 指标 | v1 | v2 |
 |------|----|----|
@@ -179,7 +360,7 @@ CLASS_THRESHOLDS = {
 
 ---
 
-## 六、系统技术细节
+## 七、系统技术细节
 
 ### VAD 三级预过滤
 
@@ -210,7 +391,7 @@ Level 3: spectral flatness > 0.5 → 宽频噪音（空调/风扇），跳过
 
 ---
 
-## 七、经验总结
+## 八、经验总结
 
 1. **先验证声音能到达模型**：VAD 过滤问题比模型本身更"上游"。被 VAD 干掉的声音，再怎么调模型参数也没用。遇到"完全没输出"的情况，先排查预处理，而不是模型。
 
@@ -226,7 +407,7 @@ Level 3: spectral flatness > 0.5 → 宽频噪音（空调/风扇），跳过
 
 ---
 
-## 八、下一步方向
+## 九、下一步方向
 
 - [ ] 采集更多多样化的 purr 录音（真实猫咪、不同场景、不同录音设备）
 - [ ] 扩充 other 类数据（当前测试准确率仅 2.5%）
